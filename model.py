@@ -52,7 +52,7 @@ class CausalSelfAttention(nn.Module):
         # flash attention make GPU go brrrrr but support is only in PyTorch nightly and still a bit scary
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and self.dropout == 0.0
         if not self.flash:
-            print("WARNING: using slow attention. Flash Attention atm needs PyTorch nightly and dropout=0.0")
+            # print("WARNING: using slow attention. Flash Attention atm needs PyTorch nightly and dropout=0.0")
             # causal mask to ensure that attention is only applied to the left in the input sequence
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
@@ -225,8 +225,8 @@ class GPT(nn.Module):
             'gpt2-large':   dict(n_layer=36, n_head=20, n_embd=1280), # 774M params
             'gpt2-xl':      dict(n_layer=48, n_head=25, n_embd=1600), # 1558M params
         }[model_type]
-        print("forcing vocab_size=50257, block_size=1024, bias=True")
-        config_args['vocab_size'] = 50257 # always 50257 for GPT model checkpoints
+        print("forcing vocab_size=50304, block_size=1024, bias=True")
+        config_args['vocab_size'] = 50304 # always 50257 for GPT model checkpoints
         config_args['block_size'] = 1024 # always 1024 for GPT model checkpoints
         config_args['bias'] = True # always True for GPT model checkpoints
         # we can override the dropout rate, if desired
@@ -258,9 +258,17 @@ class GPT(nn.Module):
                 assert sd_hf[k].shape[::-1] == sd[k].shape
                 with torch.no_grad():
                     sd[k].copy_(sd_hf[k].t())
+
+            # if the vocab size is larger, copy the trained weights aligned at the start of the embedding
+            #   table, and leave the rest of the embedding table as-is
+            elif k in ['transformer.wte.weight', 'lm_head.weight'] and sd[k].size(0) > sd_hf[k].size(0):
+                print(f"WARNING: extending vocab size from {sd_hf[k].size(0)} to {sd[k].size(0)}")
+                with torch.no_grad():
+                    sd[k][:sd_hf[k].size(0)] = sd_hf[k].detach().clone()
+
             else:
                 # vanilla copy over the other parameters
-                assert sd_hf[k].shape == sd[k].shape
+                assert sd_hf[k].shape == sd[k].shape, f'key: {k}, {sd_hf[k].shape} != {sd[k].shape}'
                 with torch.no_grad():
                     sd[k].copy_(sd_hf[k])
 
@@ -336,7 +344,7 @@ class GPT(nn.Module):
         flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
         # express our flops throughput as ratio of A100 bfloat16 peak flops
         flops_achieved = flops_per_iter * (1.0/dt) # per second
-        flops_promised = 312e12 # A100 GPU bfloat16 peak flops is 312 TFLOPS
+        flops_promised = 125e12 # A100 GPU bfloat16 peak flops is 312 TFLOPS
         mfu = flops_achieved / flops_promised
         return mfu
 

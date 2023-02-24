@@ -24,6 +24,7 @@ from contextlib import nullcontext
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
@@ -33,7 +34,7 @@ from model import GPTConfig, GPT
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
 out_dir = 'out'
-eval_interval = 2000
+eval_interval = 75
 log_interval = 1
 eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
@@ -44,9 +45,9 @@ wandb_log = False # disabled by default
 wandb_project = 'owt'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
-dataset = 'shakespeare'
-gradient_accumulation_steps = 5 # used to simulate larger batch sizes
-batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
+dataset = 'soda'
+gradient_accumulation_steps = 32 # used to simulate larger batch sizes
+batch_size = 1 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
 # model
 n_layer = 12
@@ -55,7 +56,7 @@ n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 # adamw optimizer
-learning_rate = 6e-4 # max learning rate
+learning_rate = 1e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
 weight_decay = 1e-1
 beta1 = 0.9
@@ -65,7 +66,7 @@ grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
 decay_lr = True # whether to decay the learning rate
 warmup_iters = 2000 # how many steps to warm up for
 lr_decay_iters = 600000 # should be ~= max_iters per Chinchilla
-min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
+min_lr = 1e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
@@ -106,19 +107,52 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 
 # poor man's data loader
 data_dir = os.path.join('data', dataset)
-train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
-val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+train_x_data = np.memmap(os.path.join(data_dir, 'train_x.bin'), dtype=np.uint16, mode='r')
+train_y_data = np.memmap(os.path.join(data_dir, 'train_y.bin'), dtype=np.uint16, mode='r')
+train_x_lengths = np.memmap(os.path.join(data_dir, 'train_x_lengths.bin'), dtype=int, mode='r')
+train_y_lengths = np.memmap(os.path.join(data_dir, 'train_y_lengths.bin'), dtype=int, mode='r')
+
+val_x_data = np.memmap(os.path.join(data_dir, 'validation_x.bin'), dtype=np.uint16, mode='r')
+val_y_data = np.memmap(os.path.join(data_dir, 'validation_y.bin'), dtype=np.uint16, mode='r')
+val_x_lengths = np.memmap(os.path.join(data_dir, 'validation_x_lengths.bin'), dtype=int, mode='r')
+val_y_lengths = np.memmap(os.path.join(data_dir, 'validation_y_lengths.bin'), dtype=int, mode='r')
+
+
 def get_batch(split):
-    data = train_data if split == 'train' else val_data
-    ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
+    x_data = train_x_data if split == 'train' else val_x_data
+    y_data = train_y_data if split == 'train' else val_y_data
+    x_lengths = train_x_lengths if split == 'train' else val_x_lengths
+    y_lengths = train_y_lengths if split == 'train' else val_y_lengths
+
+    # reshape lengths to be (n, 2) where n is the number of examples, and the 2 is the start and end index
+    x_lengths = x_lengths.reshape((x_lengths.shape[0]//2, 2))
+    y_lengths = y_lengths.reshape((y_lengths.shape[0]//2, 2))
+
+    # get a random index from the dataset, ensuring x is <= 1024 tokens
+    while True:
+        idx = torch.randint(x_lengths.shape[0], size=(1,)).item()
+
+        x_idxs = x_lengths[idx]
+        y_idxs = y_lengths[idx]
+
+        if x_idxs[1] - x_idxs[0] <= 1024:
+            break
+
+    x = torch.from_numpy(x_data[x_idxs[0]:x_idxs[1]].astype(np.int64))
+    y = torch.from_numpy(y_data[y_idxs[0]:y_idxs[1]].astype(np.int64))
+
+    # pad y with token -1 (ignored by cross_entropy_loss in the model) to match sequence length with x
+    x = x.unsqueeze(0).contiguous()
+    y = F.pad(y, (0, x.size(-1) - y.size(-1)), value=-1).unsqueeze(0).contiguous()
+
     if device_type == 'cuda':
         # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
         x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
     else:
         x, y = x.to(device), y.to(device)
+
     return x, y
+
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0

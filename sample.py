@@ -69,8 +69,19 @@ if load_meta:
 else:
     # ok let's assume gpt-2 encodings by default
     print("No meta.pkl found, assuming GPT-2 encodings...")
-    enc = tiktoken.get_encoding("gpt2")
-    encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
+
+    gpt2_base_tokeniser = tiktoken.get_encoding("gpt2")
+    enc = tiktoken.Encoding(
+        name="gpt2_soda",
+        pat_str=gpt2_base_tokeniser._pat_str,
+        mergeable_ranks=gpt2_base_tokeniser._mergeable_ranks,
+        special_tokens={
+            **gpt2_base_tokeniser._special_tokens,
+            "<|sep|>": 50257,
+            "<|turn|>": 50258
+        }
+    )
+    encode = lambda s: enc.encode(s, allowed_special=enc.special_tokens_set)
     decode = lambda l: enc.decode(l)
 
 # encode the beginning of the prompt
